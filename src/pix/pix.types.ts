@@ -9,10 +9,21 @@ export interface LancamentoSerializado {
   descricao: string;
 }
 
+/**
+ * Para onde vai o dinheiro.
+ *   - Pix interno: `conta` e' o cliente PayFlow dono da chave; `externo` null.
+ *   - Pix para outro banco: `conta` e' a conta de liquidacao (SPI), que recebe
+ *     o CREDITO no ledger; `externo` e' o favorecido real, do contato salvo.
+ */
+export interface DestinoPix {
+  conta: ContaPublica;
+  externo: { nome: string; banco: string | null } | null;
+}
+
 /** O que o controller devolve: transacao + destino + saldo da origem. */
 export interface ResultadoTransferencia {
   transacao: Transacao;
-  destino: ContaPublica;
+  destino: DestinoPix;
   saldoOrigem: Dinheiro;
   lancamentos: LancamentoSerializado[];
 }

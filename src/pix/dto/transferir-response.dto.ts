@@ -39,10 +39,32 @@ export class TransferirResponseDto {
   valor: string;
 
   @ApiProperty({
+    enum: ['CPF', 'EMAIL', 'TELEFONE'],
+    nullable: true,
+    description: 'Tipo da chave Pix usada',
+  })
+  tipoChave: string | null;
+
+  @ApiProperty({
+    example: '(11) 97777-2222',
+    nullable: true,
+    description: 'Chave Pix usada, formatada para exibicao',
+  })
+  chaveDestino: string | null;
+
+  @ApiProperty({
     example: 'Bruno Costa',
     description: 'Conta de destino, resolvida da chave Pix',
   })
-  destino: { id: string; nome: string; cpfMasked: string };
+  destino: {
+    /** null quando o destino e' outro banco. */
+    id: string | null;
+    nome: string;
+    cpfMasked: string | null;
+    /** true = Pix para outra instituicao (cash-out via liquidacao SPI). */
+    externo: boolean;
+    banco: string | null;
+  };
 
   @ApiProperty({
     type: [LancamentoDaTransacaoDto],

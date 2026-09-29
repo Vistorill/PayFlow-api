@@ -1,5 +1,12 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsEmail, IsString, Length, Matches, MaxLength } from 'class-validator';
+import {
+  IsEmail,
+  IsOptional,
+  IsString,
+  Length,
+  Matches,
+  MaxLength,
+} from 'class-validator';
 import { IsCpf } from '../../common/validators/is-cpf.decorator';
 
 export class RegisterDto {
@@ -19,6 +26,18 @@ export class RegisterDto {
     message: 'cpf deve conter apenas digitos, ponto e hifen',
   })
   cpf: string;
+
+  @ApiProperty({
+    example: '(11) 98888-1111',
+    required: false,
+    description: 'Celular com DDD. Opcional; vira chave Pix do tipo TELEFONE.',
+  })
+  @IsOptional()
+  @IsString()
+  @Matches(/^[\d()+\-\s]{10,20}$/, {
+    message: 'telefone deve conter apenas digitos, espacos, (), + e -',
+  })
+  telefone?: string;
 
   @ApiProperty({ example: 'senha1234', minLength: 8, maxLength: 72 })
   @IsString()

@@ -25,6 +25,19 @@ export class LancamentoResponseDto {
 
   @ApiProperty({ example: '2026-01-01T12:00:00.000Z' })
   createdAt: string;
+
+  @ApiProperty({ enum: ['PIX', 'BOLETO', 'CARTAO', 'SAQUE', 'CREDITO'] })
+  tipoTransacao: string;
+
+  @ApiProperty({ enum: ['CPF', 'EMAIL', 'TELEFONE'], nullable: true })
+  tipoChave: string | null;
+
+  @ApiProperty({
+    example: '(11) 97777-2222',
+    nullable: true,
+    description: 'Chave Pix usada na transacao (null se nao for Pix)',
+  })
+  chaveDestino: string | null;
 }
 
 export class SaldoResponseDto {

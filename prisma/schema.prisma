@@ -23,13 +23,20 @@ model Conta {
   nome      String   @db.VarChar(120)
   cpfMasked String   @map("cpf_masked") @db.VarChar(14)
   cpfHash   String   @unique @map("cpf_hash") @db.Char(64)
+  // Chave Pix de celular: so digitos, DDD + numero (10 ou 11). Opcional.
+  telefone  String?  @unique @db.VarChar(11)
+  // Contas internas do sistema (sem usuario, sem login): "TESOURARIA",
+  // "LIQUIDACAO_PIX". Null em conta de cliente.
+  sistema   String?  @unique @db.VarChar(40)
   createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
 
   usuario     Usuario?
-  comoOrigem  Transacao[] @relation("TransacaoOrigem")
-  comoDestino Transacao[] @relation("TransacaoDestino")
+  comoOrigem  Transacao[]  @relation("TransacaoOrigem")
+  comoDestino Transacao[]  @relation("TransacaoDestino")
   lancamentos Lancamento[]
+  contatos    ContatoPix[] @relation("ContatoDono")
+  contatoDe   ContatoPix[] @relation("ContatoDestino")
 
   @@index([nome])
   @@map("contas")
@@ -55,15 +62,24 @@ model Usuario {
 // A intencao de pagamento. Pode ter falhado e ainda assim existir.
 // ---------------------------------------------------------------------------
 model Transacao {
-  id             String          @id @default(uuid()) @db.Char(36)
-  idempotencyKey String          @unique @map("idempotency_key") @db.VarChar(100)
-  tipo           TipoTransacao
-  status         StatusTransacao @default(PENDENTE)
-  valor          Decimal         @db.Decimal(15, 2)
-  origemId       String          @map("origem_id") @db.Char(36)
-  destinoId      String          @map("destino_id") @db.Char(36)
-  createdAt      DateTime        @default(now()) @map("created_at") @db.DateTime(3)
-  updatedAt      DateTime        @updatedAt @map("updated_at") @db.DateTime(3)
+  id              String          @id @default(uuid()) @db.Char(36)
+  idempotencyKey  String          @unique @map("idempotency_key") @db.VarChar(100)
+  tipo            TipoTransacao
+  status          StatusTransacao @default(PENDENTE)
+  valor           Decimal         @db.Decimal(15, 2)
+  origemId        String          @map("origem_id") @db.Char(36)
+  destinoId       String          @map("destino_id") @db.Char(36)
+  // Chave Pix usada para achar o destino, como o cliente digitou (ja
+  // formatada). Null em transacoes que nao sao Pix (ex.: abertura de conta)
+  // e nas anteriores a esta coluna.
+  tipoChave       TipoChavePix?   @map("tipo_chave")
+  chaveDestino    String?         @map("chave_destino") @db.VarChar(180)
+  // Pix para OUTRA instituicao: o credito vai para a conta de liquidacao
+  // (destinoId) e o favorecido real fica registrado aqui. Null em Pix interno.
+  favorecidoNome  String?         @map("favorecido_nome") @db.VarChar(120)
+  favorecidoBanco String?         @map("favorecido_banco") @db.VarChar(60)
+  createdAt       DateTime        @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt       DateTime        @updatedAt @map("updated_at") @db.DateTime(3)
 
   origem      Conta        @relation("TransacaoOrigem", fields: [origemId], references: [id], onDelete: Restrict)
   destino     Conta        @relation("TransacaoDestino", fields: [destinoId], references: [id], onDelete: Restrict)
@@ -98,12 +114,46 @@ model Lancamento {
   @@map("lancamentos")
 }
 
+// ---------------------------------------------------------------------------
+// Agenda de contatos Pix: chaves de TERCEIROS que o usuario salvou para pagar
+// de novo sem digitar. Cada usuario so ve e so mexe nos proprios contatos.
+// Nao e' dado financeiro (so atalho), por isso Cascade na conta dona.
+// ---------------------------------------------------------------------------
+model ContatoPix {
+  id             String       @id @default(uuid()) @db.Char(36)
+  contaId        String       @map("conta_id") @db.Char(36)
+  // Null = chave de OUTRO banco (nao ha conta PayFlow para ela). Nesse caso o
+  // nome do favorecido e o banco sao informados pelo usuario ao salvar.
+  destinoId      String?      @map("destino_id") @db.Char(36)
+  nomeFavorecido String?      @map("nome_favorecido") @db.VarChar(120)
+  banco          String?      @db.VarChar(60)
+  apelido        String?      @db.VarChar(60)
+  tipoChave      TipoChavePix @map("tipo_chave")
+  // Forma canonica de exibicao (ver exibirChavePix): a mesma chave sempre
+  // gera o mesmo texto, entao serve tambem para o indice de unicidade.
+  chave          String       @db.VarChar(180)
+  createdAt      DateTime     @default(now()) @map("created_at") @db.DateTime(3)
+
+  conta   Conta  @relation("ContatoDono", fields: [contaId], references: [id], onDelete: Cascade)
+  destino Conta? @relation("ContatoDestino", fields: [destinoId], references: [id], onDelete: Restrict)
+
+  @@unique([contaId, tipoChave, chave])
+  @@index([destinoId])
+  @@map("contatos_pix")
+}
+
 enum TipoTransacao {
   PIX
   BOLETO
   CARTAO
   SAQUE
   CREDITO
+}
+
+enum TipoChavePix {
+  CPF
+  EMAIL
+  TELEFONE
 }
 
 enum StatusTransacao {

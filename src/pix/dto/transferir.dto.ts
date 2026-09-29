@@ -1,6 +1,10 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsString, Length, Matches } from 'class-validator';
+import { IsIn, IsOptional, IsString, Length, Matches } from 'class-validator';
+import {
+  TIPOS_CHAVE_PIX,
+  type TipoChavePix,
+} from '../../common/utils/chave-pix';
 
 /**
  * Aceita "50", "50.00" e 50, e normaliza para string.
@@ -30,15 +34,27 @@ const VALOR_VALIDO = /^(?!0+(?:\.0{1,2})?$)\d{1,9}(?:\.\d{1,2})?$/;
 
 export class TransferirDto {
   @ApiProperty({
+    enum: TIPOS_CHAVE_PIX,
+    default: 'CPF',
+    required: false,
+    description:
+      'Tipo da chave Pix de destino. Omitido = CPF (compatibilidade).',
+  })
+  @IsOptional()
+  @IsIn(TIPOS_CHAVE_PIX, {
+    message: `tipoChave deve ser um de: ${TIPOS_CHAVE_PIX.join(', ')}`,
+  })
+  tipoChave?: TipoChavePix;
+
+  @ApiProperty({
     example: '123.456.789-09',
-    description: 'Chave Pix de destino. Neste dominio, a chave e o CPF.',
+    description:
+      'Chave Pix de destino: CPF (com ou sem mascara), e-mail ou celular ' +
+      'com DDD. O formato e validado conforme `tipoChave`.',
   })
   @Transform(paraTexto)
   @IsString()
-  @Length(11, 14)
-  @Matches(/^[\d.\-\s]{11,14}$/, {
-    message: 'chaveDestino deve ser um CPF (com ou sem mascara)',
-  })
+  @Length(3, 180)
   chaveDestino: string;
 
   @ApiProperty({
