@@ -1,0 +1,118 @@
+// Schema do core de pagamentos (referência Cactvs / Institution de Pagamento).
+//
+// Regras estruturais que valem para TODA tabela deste arquivo:
+//   1. Nenhuma tabela guarda "saldo". Saldo e' sempre derivado do ledger.
+//   2. `lancamentos` e' append-only. Nunca UPDATE, nunca DELETE.
+//   3. onDelete: Restrict em tudo que e' dado financeiro.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Servico de Contas: identidade da conta. Dono de QUEM e', nao de QUANTO.
+// Nao tem senha. Nao tem saldo. Nao tem dinheiro.
+// ---------------------------------------------------------------------------
+model Conta {
+  id        String   @id @default(uuid()) @db.Char(36)
+  nome      String   @db.VarChar(120)
+  cpfMasked String   @map("cpf_masked") @db.VarChar(14)
+  cpfHash   String   @unique @map("cpf_hash") @db.Char(64)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  usuario     Usuario?
+  comoOrigem  Transacao[] @relation("TransacaoOrigem")
+  comoDestino Transacao[] @relation("TransacaoDestino")
+  lancamentos Lancamento[]
+
+  @@index([nome])
+  @@map("contas")
+}
+
+// ---------------------------------------------------------------------------
+// Auth Service: credencial. Dono de COMO SE ENTRA.
+// Separado de Conta de proposito. Em producao isto vira outro servico/banco.
+// ---------------------------------------------------------------------------
+model Usuario {
+  id        String   @id @default(uuid()) @db.Char(36)
+  contaId   String   @unique @map("conta_id") @db.Char(36)
+  email     String   @unique @db.VarChar(180)
+  senhaHash String   @map("senha_hash") @db.VarChar(60)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  conta Conta @relation(fields: [contaId], references: [id], onDelete: Restrict)
+
+  @@map("usuarios")
+}
+
+// ---------------------------------------------------------------------------
+// A intencao de pagamento. Pode ter falhado e ainda assim existir.
+// ---------------------------------------------------------------------------
+model Transacao {
+  id             String          @id @default(uuid()) @db.Char(36)
+  idempotencyKey String          @unique @map("idempotency_key") @db.VarChar(100)
+  tipo           TipoTransacao
+  status         StatusTransacao @default(PENDENTE)
+  valor          Decimal         @db.Decimal(15, 2)
+  origemId       String          @map("origem_id") @db.Char(36)
+  destinoId      String          @map("destino_id") @db.Char(36)
+  createdAt      DateTime        @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt      DateTime        @updatedAt @map("updated_at") @db.DateTime(3)
+
+  origem      Conta        @relation("TransacaoOrigem", fields: [origemId], references: [id], onDelete: Restrict)
+  destino     Conta        @relation("TransacaoDestino", fields: [destinoId], references: [id], onDelete: Restrict)
+  lancamentos Lancamento[]
+
+  @@index([origemId, createdAt])
+  @@index([destinoId])
+  @@map("transacoes")
+}
+
+// ---------------------------------------------------------------------------
+// O livro-razao. Fonte unica da verdade. Append-only.
+//
+// saldo(conta) = SUM(valor WHERE tipo = CREDITO) - SUM(valor WHERE tipo = DEBITO)
+//
+// Partida dobrada: toda transacao gera exatamente 2 lancamentos que somam zero.
+// ---------------------------------------------------------------------------
+model Lancamento {
+  id          String         @id @default(uuid()) @db.Char(36)
+  transacaoId String         @map("transacao_id") @db.Char(36)
+  contaId     String         @map("conta_id") @db.Char(36)
+  tipo        TipoLancamento
+  valor       Decimal        @db.Decimal(15, 2)
+  descricao   String         @db.VarChar(140)
+  createdAt   DateTime       @default(now()) @map("created_at") @db.DateTime(3)
+
+  transacao Transacao @relation(fields: [transacaoId], references: [id], onDelete: Restrict)
+  conta     Conta     @relation(fields: [contaId], references: [id], onDelete: Restrict)
+
+  @@index([contaId, createdAt])
+  @@index([transacaoId])
+  @@map("lancamentos")
+}
+
+enum TipoTransacao {
+  PIX
+  BOLETO
+  CARTAO
+  SAQUE
+  CREDITO
+}
+
+enum StatusTransacao {
+  PENDENTE
+  CONCLUIDA
+  FALHA
+}
+
+enum TipoLancamento {
+  DEBITO
+  CREDITO
+}
