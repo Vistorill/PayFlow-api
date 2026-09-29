@@ -101,9 +101,16 @@ export class PixService {
     // ------------------------------------------------------------------
     // Fase C -- A transacao contabil.
     // ------------------------------------------------------------------
-    await this.movimentar(intencao.transacao, origem, destino, valor);
+    // A resposta usa a transacao DEPOIS do commit: a `intencao.transacao` em
+    // memoria ainda diz PENDENTE.
+    const concluida = await this.movimentar(
+      intencao.transacao,
+      origem,
+      destino,
+      valor,
+    );
 
-    return this.montarResultado(intencao.transacao, destino);
+    return this.montarResultado(concluida, destino);
   }
 
   // -------------------------------------------------------------------------
@@ -215,9 +222,9 @@ export class PixService {
     origem: ContaPublica,
     destino: ContaPublica,
     valor: Dinheiro,
-  ): Promise<void> {
+  ): Promise<Transacao> {
     try {
-      await this.prisma.$transaction(
+      const concluida = await this.prisma.$transaction(
         async (tx) => {
           // ---- Lock de linha ----
           // Trancamos a LINHA DA CONTA, e nao as linhas do lancamento.
@@ -273,7 +280,7 @@ export class PixService {
             ],
           });
 
-          await tx.transacao.update({
+          return tx.transacao.update({
             where: { id: transacao.id },
             data: { status: 'CONCLUIDA' },
           });
@@ -293,6 +300,8 @@ export class PixService {
       this.logger.log(
         `Pix ${transacao.id} concluido: ${paraTexto(valor)} de ${origem.nome} para ${destino.nome}`,
       );
+
+      return concluida;
     } catch (erro) {
       if (erro instanceof SaldoInsuficienteError) {
         // O ROLLBACK ja aconteceu. O UPDATE de status FALHA precisa ser uma

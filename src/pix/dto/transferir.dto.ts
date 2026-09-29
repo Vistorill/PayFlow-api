@@ -1,13 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { Transform, Type } from 'class-transformer';
-import {
-  IsNumber,
-  IsPositive,
-  IsString,
-  Length,
-  Matches,
-  Max,
-} from 'class-validator';
+import { Transform } from 'class-transformer';
+import { IsString, Length, Matches } from 'class-validator';
 
 /**
  * Aceita "50", "50.00" e 50, e normaliza para string.
@@ -20,6 +13,20 @@ import {
  */
 const paraTexto = ({ value }: { value: unknown }): unknown =>
   typeof value === 'number' ? value.toString() : value;
+
+/** Igual a `paraTexto`, e ainda aceita virgula decimal ("50,00"). */
+const valorParaTexto = ({ value }: { value: unknown }): unknown => {
+  const texto = paraTexto({ value });
+  return typeof texto === 'string' ? texto.trim().replace(',', '.') : texto;
+};
+
+/**
+ * Positivo, ate 2 casas, abaixo de 1 bilhao (9 digitos inteiros).
+ * Validado como TEXTO: se passasse por number, `@Type(() => Number)` e o
+ * `@Transform` brigariam pela ordem e o valor chegaria ao validador como string
+ * -- recusando qualquer entrada. O lookahead rejeita zero ("0", "0.00").
+ */
+const VALOR_VALIDO = /^(?!0+(?:\.0{1,2})?$)\d{1,9}(?:\.\d{1,2})?$/;
 
 export class TransferirDto {
   @ApiProperty({
@@ -38,17 +45,13 @@ export class TransferirDto {
     example: '50.00',
     description: 'Valor positivo, com no maximo 2 casas decimais.',
   })
-  @Transform(paraTexto)
-  @Type(() => Number)
-  @IsNumber(
-    { maxDecimalPlaces: 2 },
-    {
-      message: 'valor deve ser um numero com no maximo 2 casas decimais',
-    },
-  )
-  @IsPositive({ message: 'valor deve ser maior que zero' })
-  @Max(1_000_000_000, { message: 'valor excede o limite de uma transferencia' })
-  valor: number;
+  @Transform(valorParaTexto)
+  @IsString({ message: 'valor deve ser um numero ou texto numerico' })
+  @Matches(VALOR_VALIDO, {
+    message:
+      'valor deve ser maior que zero, abaixo de 1 bilhao e ter no maximo 2 casas decimais',
+  })
+  valor: string;
 
   @ApiProperty({
     example: 'pix-8f2a1c9e-4b7d-4e3a-9c1f-0a5d6e8b2c47',
