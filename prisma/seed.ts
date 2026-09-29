@@ -18,8 +18,18 @@ const CONTA_SISTEMA = {
 };
 
 const CONTAS = [
-  { nome: 'Ana Souza', email: 'ana@email.com', cpf: '111.444.777-35' },
-  { nome: 'Bruno Costa', email: 'bruno@email.com', cpf: '123.456.789-09' },
+  {
+    nome: 'Ana Souza',
+    email: 'ana@email.com',
+    cpf: '111.444.777-35',
+    telefone: '11988881111',
+  },
+  {
+    nome: 'Bruno Costa',
+    email: 'bruno@email.com',
+    cpf: '123.456.789-09',
+    telefone: '11977772222',
+  },
 ];
 
 function hashCpf(cpf: string): string {
@@ -36,22 +46,25 @@ async function main() {
 
   const sistema = await prisma.conta.upsert({
     where: { cpfHash: hashCpf(CONTA_SISTEMA.cpf) },
-    update: {},
+    update: { sistema: 'TESOURARIA' },
     create: {
       nome: CONTA_SISTEMA.nome,
       cpfMasked: maskCpf(CONTA_SISTEMA.cpf),
       cpfHash: hashCpf(CONTA_SISTEMA.cpf),
+      sistema: 'TESOURARIA',
     },
   });
 
   for (const entrada of CONTAS) {
     const conta = await prisma.conta.upsert({
       where: { cpfHash: hashCpf(entrada.cpf) },
-      update: {},
+      // Contas seedadas antes da chave de celular recebem o telefone aqui.
+      update: { telefone: entrada.telefone },
       create: {
         nome: entrada.nome,
         cpfMasked: maskCpf(entrada.cpf),
         cpfHash: hashCpf(entrada.cpf),
+        telefone: entrada.telefone,
       },
     });
 
@@ -65,7 +78,9 @@ async function main() {
      * Saldo de partida entra pelo LEDGER. Nao existe coluna `saldo` para
      * inicializar -- uma conta sem lancamento tem saldo 0 por construcao.
      */
-    const jaTemLancamento = await prisma.lancamento.count({ where: { contaId: conta.id } });
+    const jaTemLancamento = await prisma.lancamento.count({
+      where: { contaId: conta.id },
+    });
 
     if (jaTemLancamento === 0) {
       const valor = SALDO_INICIAL_EM_CENTAVOS / 100;
@@ -106,6 +121,35 @@ async function main() {
     );
   }
 
+  /**
+   * Um contato Pix de exemplo (Ana -> celular do Bruno), para a tela de Pix ja
+   * abrir com algo no select "Meus contatos".
+   */
+  const [ana, bruno] = await Promise.all(
+    CONTAS.map((c) =>
+      prisma.conta.findUniqueOrThrow({ where: { cpfHash: hashCpf(c.cpf) } }),
+    ),
+  );
+  const chaveBruno = '(11) 97777-2222'; // mesma forma de exibirChavePix
+  await prisma.contatoPix.upsert({
+    where: {
+      contaId_tipoChave_chave: {
+        contaId: ana.id,
+        tipoChave: 'TELEFONE',
+        chave: chaveBruno,
+      },
+    },
+    update: {},
+    create: {
+      contaId: ana.id,
+      destinoId: bruno.id,
+      tipoChave: 'TELEFONE',
+      chave: chaveBruno,
+      apelido: 'Bruno',
+    },
+  });
+  console.log(`  Contato Pix: Ana -> Bruno (celular ${chaveBruno})`);
+
   const totalCreditos = await prisma.lancamento.aggregate({
     where: { tipo: 'CREDITO' },
     _sum: { valor: true },
@@ -135,10 +179,14 @@ main()
     if (codigo === 'P1000') {
       console.error('\n  -> Usuario ou senha do banco incorretos.');
       console.error('  -> Confira o DATABASE_URL no arquivo .env');
-      console.error('  -> O usuario precisa existir. Rode database\\setup.sql como root.');
+      console.error(
+        '  -> O usuario precisa existir. Rode database\\setup.sql como root.',
+      );
     }
     if (codigo === 'P1001') {
-      console.error('\n  -> Banco cactvs_payments nao existe. Rode database\\setup.sql.');
+      console.error(
+        '\n  -> Banco cactvs_payments nao existe. Rode database\\setup.sql.',
+      );
     }
 
     if (codigo === 'P1000' || codigo === 'P1001') {

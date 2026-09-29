@@ -89,7 +89,23 @@ export class PixController {
       tipo: resultado.transacao.tipo,
       status: resultado.transacao.status,
       valor: paraTexto(resultado.transacao.valor),
-      destino: resultado.destino,
+      tipoChave: resultado.transacao.tipoChave,
+      chaveDestino: resultado.transacao.chaveDestino,
+      destino: resultado.destino.externo
+        ? {
+            // Pix para outro banco: quem aparece e' o favorecido, nao a conta
+            // de liquidacao interna (cujo id nao interessa ao cliente).
+            id: null,
+            nome: resultado.destino.externo.nome,
+            cpfMasked: null,
+            externo: true,
+            banco: resultado.destino.externo.banco,
+          }
+        : {
+            ...resultado.destino.conta,
+            externo: false,
+            banco: null,
+          },
       lancamentos: resultado.lancamentos,
       saldoOrigem: paraTexto(resultado.saldoOrigem),
       createdAt: resultado.transacao.createdAt.toISOString(),

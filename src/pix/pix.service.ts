@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   Logger,
@@ -13,12 +14,25 @@ import {
   paraTexto,
   type Dinheiro,
 } from '../common/utils/dinheiro';
+import {
+  exibirChavePix,
+  normalizarChavePix,
+  type TipoChavePix,
+} from '../common/utils/chave-pix';
 import { eConflitoDeUnico } from '../common/utils/prisma';
 import { ContasService } from '../contas/contas.service';
 import type { ContaPublica } from '../contas/contas.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { TransferirDto } from './dto/transferir.dto';
-import type { ReenvioIdempotente, ResultadoTransferencia } from './pix.types';
+import type {
+  DestinoPix,
+  ReenvioIdempotente,
+  ResultadoTransferencia,
+} from './pix.types';
+
+/** `lancamentos.descricao` e' VARCHAR(140). */
+const limitar = (texto: string): string =>
+  texto.length <= 140 ? texto : `${texto.slice(0, 139)}…`;
 
 /**
  * Sinal interno, nunca vaza para o controller: distingue "a transacao foi
@@ -70,14 +84,24 @@ export class PixService {
     // conta alheia so trocando um campo no curl.
     const origem = await this.contasService.detalhe(contaIdOrigem);
 
-    const destino = await this.contasService.buscarPorChavePix(
-      dto.chaveDestino,
-    );
-    if (!destino) {
-      throw new NotFoundException('Chave Pix de destino nao encontrada');
+    const tipoChave = dto.tipoChave ?? 'CPF';
+    const chave = normalizarChavePix(tipoChave, dto.chaveDestino);
+    if (!chave) {
+      throw new BadRequestException({
+        codigo: 'CHAVE_INVALIDA',
+        mensagem: `chaveDestino nao e' uma chave ${tipoChave} valida`,
+      });
     }
 
-    if (destino.id === origem.id) {
+    const exibicao = exibirChavePix(tipoChave, chave);
+    const destino = await this.resolverDestino(
+      origem.id,
+      tipoChave,
+      chave,
+      exibicao,
+    );
+
+    if (destino.conta.id === origem.id) {
       throw new UnprocessableEntityException({
         codigo: 'DESTINO_IGUAL_ORIGEM',
         mensagem: 'O destino nao pode ser a propria conta de origem',
@@ -90,8 +114,9 @@ export class PixService {
     const intencao = await this.registrarIntencao(
       dto.idempotencyKey,
       origem.id,
-      destino.id,
+      destino,
       valor,
+      { tipo: tipoChave, exibicao },
     );
 
     if (intencao.replay) {
@@ -113,6 +138,50 @@ export class PixService {
     return this.montarResultado(concluida, destino);
   }
 
+  /**
+   * Resolve a chave como um DICT faria:
+   *   1. chave de cliente PayFlow   -> Pix interno, credito direto na conta;
+   *   2. chave salva pelo usuario como contato de OUTRO banco -> cash-out:
+   *      credito na conta de liquidacao (SPI), favorecido registrado;
+   *   3. nenhum dos dois -> 404. Sem DICT real nao ha como descobrir o nome do
+   *      dono de uma chave externa, entao ela precisa ser cadastrada antes.
+   */
+  private async resolverDestino(
+    origemId: string,
+    tipoChave: TipoChavePix,
+    chave: string,
+    exibicao: string,
+  ): Promise<DestinoPix> {
+    const interno = await this.contasService.buscarPorChavePix(
+      tipoChave,
+      chave,
+    );
+    if (interno) return { conta: interno, externo: null };
+
+    const contato = await this.prisma.contatoPix.findUnique({
+      where: {
+        contaId_tipoChave_chave: {
+          contaId: origemId,
+          tipoChave,
+          chave: exibicao,
+        },
+      },
+    });
+    if (contato && !contato.destinoId && contato.nomeFavorecido) {
+      return {
+        conta: await this.contasService.contaLiquidacaoPix(),
+        externo: { nome: contato.nomeFavorecido, banco: contato.banco },
+      };
+    }
+
+    throw new NotFoundException({
+      codigo: 'CHAVE_NAO_ENCONTRADA',
+      mensagem:
+        'Chave Pix nao encontrada. Para pagar uma chave de outro banco, ' +
+        'salve-a antes nos seus contatos.',
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Fase B
   // -------------------------------------------------------------------------
@@ -130,8 +199,9 @@ export class PixService {
   private async registrarIntencao(
     idempotencyKey: string,
     origemId: string,
-    destinoId: string,
+    destino: DestinoPix,
     valor: Dinheiro,
+    chave: { tipo: TipoChavePix; exibicao: string },
   ): Promise<{ transacao: Transacao; replay: boolean }> {
     try {
       const transacao = await this.prisma.transacao.create({
@@ -141,7 +211,11 @@ export class PixService {
           status: 'PENDENTE',
           valor,
           origemId,
-          destinoId,
+          destinoId: destino.conta.id,
+          tipoChave: chave.tipo,
+          chaveDestino: chave.exibicao,
+          favorecidoNome: destino.externo?.nome ?? null,
+          favorecidoBanco: destino.externo?.banco ?? null,
         },
       });
 
@@ -176,7 +250,7 @@ export class PixService {
    */
   private async tratarReenvio(
     transacao: Transacao,
-    destino: ContaPublica,
+    destino: DestinoPix,
   ): Promise<ReenvioIdempotente> {
     if (transacao.status === 'PENDENTE') {
       throw new ConflictException({
@@ -220,9 +294,21 @@ export class PixService {
   private async movimentar(
     transacao: Transacao,
     origem: ContaPublica,
-    destino: ContaPublica,
+    destino: DestinoPix,
     valor: Dinheiro,
   ): Promise<Transacao> {
+    // Pix externo: o credito cai na conta de liquidacao, mas o extrato do
+    // cliente mostra o favorecido real e o banco.
+    const favorecido = destino.externo
+      ? `${destino.externo.nome} (${destino.externo.banco ?? 'outro banco'})`
+      : destino.conta.nome;
+    const descricaoDebito = limitar(`Pix enviado para ${favorecido}`);
+    const descricaoCredito = limitar(
+      destino.externo
+        ? `Liquidacao SPI: ${origem.nome} -> ${favorecido}`
+        : `Pix recebido de ${origem.nome}`,
+    );
+
     try {
       const concluida = await this.prisma.$transaction(
         async (tx) => {
@@ -268,14 +354,14 @@ export class PixService {
                 contaId: origem.id,
                 tipo: 'DEBITO',
                 valor,
-                descricao: `Pix enviado para ${destino.nome}`,
+                descricao: descricaoDebito,
               },
               {
                 transacaoId: transacao.id,
-                contaId: destino.id,
+                contaId: destino.conta.id,
                 tipo: 'CREDITO',
                 valor,
-                descricao: `Pix recebido de ${origem.nome}`,
+                descricao: descricaoCredito,
               },
             ],
           });
@@ -298,7 +384,7 @@ export class PixService {
       // separa ledger de liquidacao: o livro fecha aqui, a conciliacao
       // acontece depois, e uma falha la nao desfaz o Pix.
       this.logger.log(
-        `Pix ${transacao.id} concluido: ${paraTexto(valor)} de ${origem.nome} para ${destino.nome}`,
+        `Pix ${transacao.id} concluido: ${paraTexto(valor)} de ${origem.nome} para ${favorecido}`,
       );
 
       return concluida;
@@ -345,7 +431,7 @@ export class PixService {
    */
   private async montarResultado(
     transacao: Transacao,
-    destino: ContaPublica,
+    destino: DestinoPix,
   ): Promise<ResultadoTransferencia> {
     const [lancamentos, agrupado] = await Promise.all([
       this.prisma.lancamento.findMany({

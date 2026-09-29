@@ -14,6 +14,11 @@ export interface LancamentoExtrato {
   valor: Dinheiro;
   descricao: string;
   createdAt: Date;
+  transacao: {
+    tipo: string;
+    tipoChave: string | null;
+    chaveDestino: string | null;
+  };
 }
 
 export interface ConsultaSaldo {

@@ -3,9 +3,14 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import type { TipoChavePix } from '../common/utils/chave-pix';
 import { hashCpf } from '../common/utils/cpf';
 import { saldoDoLedger } from '../common/utils/dinheiro';
+import { eConflitoDeUnico } from '../common/utils/prisma';
+
+export const CONTA_LIQUIDACAO_PIX = 'LIQUIDACAO_PIX';
 import type {
   ConsultaExtrato,
   ConsultaSaldo,
@@ -24,6 +29,53 @@ import type { ExtratoQueryDto } from './dto/extrato-query.dto';
 @Injectable()
 export class ContasService {
   constructor(private readonly prisma: PrismaService) {}
+
+  private contaLiquidacaoId: string | null = null;
+
+  /**
+   * Conta de liquidacao Pix (SPI): contrapartida de todo Pix enviado para
+   * OUTRA instituicao. O cliente e' debitado e esta conta e' creditada -- o
+   * dinheiro "sai do banco" sem quebrar a partida dobrada, e o saldo dela e'
+   * quanto o PayFlow deve liquidar com os outros bancos.
+   *
+   * Criada sob demanda (nao depende do seed). Nao tem usuario, logo nao loga;
+   * e o cpf_hash e' derivado de um marcador, nunca de um CPF real, entao
+   * nenhuma chave Pix a encontra.
+   */
+  async contaLiquidacaoPix(): Promise<ContaPublica> {
+    const select = { id: true, nome: true, cpfMasked: true } as const;
+    if (this.contaLiquidacaoId) {
+      return this.prisma.conta.findUniqueOrThrow({
+        where: { id: this.contaLiquidacaoId },
+        select,
+      });
+    }
+
+    const where = { sistema: CONTA_LIQUIDACAO_PIX };
+    let conta = await this.prisma.conta.findUnique({ where, select });
+    if (!conta) {
+      try {
+        conta = await this.prisma.conta.create({
+          data: {
+            sistema: CONTA_LIQUIDACAO_PIX,
+            nome: 'Liquidacao Pix (SPI)',
+            cpfMasked: '-',
+            cpfHash: createHash('sha256')
+              .update(`sistema:${CONTA_LIQUIDACAO_PIX}`)
+              .digest('hex'),
+          },
+          select,
+        });
+      } catch (erro) {
+        // Duas requisicoes criando ao mesmo tempo: a outra venceu, usa a dela.
+        if (!eConflitoDeUnico(erro)) throw erro;
+        conta = await this.prisma.conta.findUniqueOrThrow({ where, select });
+      }
+    }
+
+    this.contaLiquidacaoId = conta.id;
+    return conta;
+  }
 
   /**
    * Fecho de propriedade.
@@ -71,6 +123,13 @@ export class ContasService {
         orderBy: { createdAt: 'desc' },
         take: pagina.take,
         skip: pagina.skip,
+        // Resumo da transacao para a linha do extrato (a chave Pix usada);
+        // o detalhe completo fica em GET /transacoes/:id.
+        include: {
+          transacao: {
+            select: { tipo: true, tipoChave: true, chaveDestino: true },
+          },
+        },
       }),
       this.prisma.lancamento.count({ where: { contaId } }),
       this.prisma.lancamento.groupBy({
@@ -104,24 +163,41 @@ export class ContasService {
   }
 
   /**
-   * Resolve a chave Pix de destino em uma Conta.
+   * Resolve a chave Pix de destino em uma Conta. A chave chega JA normalizada
+   * (ver `normalizarChavePix`), e cada tipo aponta para um indice unico:
    *
-   * A chave deste dominio e' o CPF -- que, aliás, e' um tipo de chave Pix
-   * valido de verdade. Nao criamos coluna `chave_pix` porque o CPF ja e'
-   * identificador unico da conta e o hash SHA-256 dele e' deterministico: hashear
-   * a chave recebida e comparar com `cpf_hash` acha a conta em um indice unico,
-   * sem varrer tabela. (Guardar o CPF em claro seria o oposto do certo: ele e'
-   * dado pessoal e nao tem por que estar legivel no banco.)
+   *   CPF      -> `contas.cpf_hash`. Nao ha CPF em claro no banco: hashear a
+   *               chave e comparar acha a conta sem expor dado pessoal.
+   *   EMAIL    -> `usuarios.email`, o mesmo e-mail do login (1:1 com a conta).
+   *   TELEFONE -> `contas.telefone`, so digitos.
    *
    * Devolve null em chave desconhecida -- quem decide o erro e' o chamador, que
    * conhece o contexto da operacao.
    */
-  async buscarPorChavePix(chave: string): Promise<ContaPublica | null> {
-    const conta = await this.prisma.conta.findUnique({
-      where: { cpfHash: hashCpf(chave) },
-      select: { id: true, nome: true, cpfMasked: true },
-    });
+  async buscarPorChavePix(
+    tipo: TipoChavePix,
+    chaveNormalizada: string,
+  ): Promise<ContaPublica | null> {
+    const select = { id: true, nome: true, cpfMasked: true } as const;
 
-    return conta;
+    switch (tipo) {
+      case 'CPF':
+        return this.prisma.conta.findUnique({
+          where: { cpfHash: hashCpf(chaveNormalizada) },
+          select,
+        });
+      case 'TELEFONE':
+        return this.prisma.conta.findUnique({
+          where: { telefone: chaveNormalizada },
+          select,
+        });
+      case 'EMAIL': {
+        const usuario = await this.prisma.usuario.findUnique({
+          where: { email: chaveNormalizada },
+          select: { conta: { select } },
+        });
+        return usuario?.conta ?? null;
+      }
+    }
   }
 }

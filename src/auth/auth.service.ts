@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
+import { normalizarTelefone } from '../common/utils/chave-pix';
 import { hashCpf, maskCpf } from '../common/utils/cpf';
 import { eConflitoDeUnico } from '../common/utils/prisma';
 import { PrismaService } from '../prisma/prisma.service';
@@ -42,6 +43,16 @@ export class AuthService {
     const cpfMasked = maskCpf(dto.cpf);
     const nome = dto.nome.trim();
 
+    let telefone: string | null = null;
+    if (dto.telefone) {
+      telefone = normalizarTelefone(dto.telefone);
+      if (!telefone) {
+        throw new BadRequestException(
+          'telefone deve ter DDD + 8 ou 9 digitos, ex.: (11) 98888-1111',
+        );
+      }
+    }
+
     // Checagem antecipada so para uma mensagem de erro amigavel. A garantia real
     // de unicidade vem do indice UNIQUE do banco (ver tratarConflitoUnico).
     const contaExistente = await this.prisma.conta.findUnique({
@@ -51,13 +62,22 @@ export class AuthService {
     if (contaExistente) {
       throw new ConflictException('Ja existe uma conta com este CPF');
     }
+    if (
+      telefone &&
+      (await this.prisma.conta.findUnique({
+        where: { telefone },
+        select: { id: true },
+      }))
+    ) {
+      throw new ConflictException('Ja existe uma conta com este telefone');
+    }
 
     const senhaHash = await bcrypt.hash(dto.senha, BCRYPT_SALT_ROUNDS);
 
     try {
       const usuario = await this.prisma.$transaction(async (tx) => {
         const conta = await tx.conta.create({
-          data: { nome, cpfMasked, cpfHash },
+          data: { nome, cpfMasked, cpfHash, telefone },
         });
 
         return tx.usuario.create({
@@ -76,7 +96,7 @@ export class AuthService {
     } catch (erro) {
       if (eConflitoDeUnico(erro)) {
         throw new ConflictException(
-          'Ja existe um registro com este email ou CPF',
+          'Ja existe um registro com este email, CPF ou telefone',
         );
       }
       throw erro;
