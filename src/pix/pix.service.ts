@@ -6,6 +6,7 @@ import {
   NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Prisma, type Transacao } from '@prisma/client';
 import {
   saldoCobre,
@@ -22,8 +23,14 @@ import {
 import { eConflitoDeUnico } from '../common/utils/prisma';
 import { ContasService } from '../contas/contas.service';
 import type { ContaPublica } from '../contas/contas.types';
+import { OutboxService, type Tx } from '../mensageria/outbox.service';
+import { TOPICOS } from '../mensageria/topicos';
 import { PrismaService } from '../prisma/prisma.service';
+import { gerarEndToEndId } from '../spi/iso20022/identificadores';
+import { EVENTO_SPI, type DadosMensagemSpi } from '../spi/spi.eventos';
 import { TransferirDto } from './dto/transferir.dto';
+import { EVENTOS_PIX, registrarEventoPix, valorDoEvento } from './eventos-pix';
+import { montarOrdemPagamento } from './spi/mensagens-spi';
 import type {
   DestinoPix,
   ReenvioIdempotente,
@@ -61,11 +68,21 @@ class SaldoInsuficienteError extends Error {
 @Injectable()
 export class PixService {
   private readonly logger = new Logger(PixService.name);
+  private readonly ispb: string;
+  private readonly ispbContraparte: string;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly contasService: ContasService,
-  ) {}
+    private readonly outbox: OutboxService,
+    config: ConfigService,
+  ) {
+    this.ispb = config.get<string>('PIX_ISPB', '12345678');
+    this.ispbContraparte = config.get<string>(
+      'SPI_ISPB_CONTRAPARTE',
+      '87654321',
+    );
+  }
 
   /**
    * @returns resultado da transferencia, ou `undefined` + sinal de reenvio
@@ -216,6 +233,10 @@ export class PixService {
           chaveDestino: chave.exibicao,
           favorecidoNome: destino.externo?.nome ?? null,
           favorecidoBanco: destino.externo?.banco ?? null,
+          // Pix para outro banco ganha o EndToEndId ja na intencao: e' a chave
+          // de tudo que vem depois (pacs.008, pacs.002, pacs.004, particao).
+          endToEndId: destino.externo ? gerarEndToEndId(this.ispb) : null,
+          direcaoSpi: destino.externo ? 'ENVIADO' : null,
         },
       });
 
@@ -241,10 +262,12 @@ export class PixService {
   /**
    * Reenvio com a MESMA chave. Nao cria nada e nao debita de novo.
    *
-   * Tres casos:
+   * Quatro casos:
    *   - CONCLUIDA: devolve o mesmo resultado com 200. O cliente pediu, foi feito.
-   *   - PENDENTE: a request original ainda esta em voo. 409 + "reenvie em
-   *     instantes" -- prometer sucesso aqui seria mentir sobre o dinheiro.
+   *   - PENDENTE com statusSpi: Pix para outro banco ja debitado, aguardando o
+   *     SPI. Devolve o mesmo 202 da primeira chamada.
+   *   - PENDENTE sem statusSpi: a request original ainda esta em voo. 409 +
+   *     "reenvie em instantes" -- prometer sucesso seria mentir sobre o dinheiro.
    *   - FALHA: devolve 422 com o mesmo codigo de erro da primeira tentativa,
    *     para o front tratar as duas respostas igual.
    */
@@ -252,6 +275,13 @@ export class PixService {
     transacao: Transacao,
     destino: DestinoPix,
   ): Promise<ReenvioIdempotente> {
+    if (transacao.status === 'PENDENTE' && transacao.statusSpi) {
+      return {
+        emProcessamento: true,
+        resultado: await this.montarResultado(transacao, destino),
+      };
+    }
+
     if (transacao.status === 'PENDENTE') {
       throw new ConflictException({
         codigo: 'TRANSACAO_EM_PROCESSAMENTO',
@@ -288,7 +318,10 @@ export class PixService {
    *   recalcula o saldo a partir do ledger
    *   saldo >= valor?
    *     nao  -> lanca (ROLLBACK) e a transacao vira FALHA
-   *     sim  -> grava os 2 lancamentos e marca CONCLUIDA
+   *     sim  -> grava os 2 lancamentos e
+   *             - Pix interno: marca CONCLUIDA + eventos settled/received
+   *             - Pix para outro banco: fica PENDENTE (statusSpi CRIADO) e o
+   *               comando pacs.008 entra no outbox. Quem conclui e' o pacs.002.
    * COMMIT
    */
   private async movimentar(
@@ -366,10 +399,21 @@ export class PixService {
             ],
           });
 
-          return tx.transacao.update({
+          if (destino.externo) {
+            const pendente = await tx.transacao.update({
+              where: { id: transacao.id },
+              data: { statusSpi: 'CRIADO' },
+            });
+            await this.enfileirarPacs008(tx, pendente, origem);
+            return pendente;
+          }
+
+          const concluida = await tx.transacao.update({
             where: { id: transacao.id },
             data: { status: 'CONCLUIDA' },
           });
+          await this.eventosPixInterno(tx, concluida, origem, destino);
+          return concluida;
         },
         {
           // Declarado explicitamente mesmo sendo o default do MySQL: fixa o
@@ -378,13 +422,13 @@ export class PixService {
         },
       );
 
-      // Fase D (planejada, fora do escopo atual): publicar
-      // TRANSACAO_CONCLUIDA num event bus. Consumidores -- notificacao push,
-      // ETL, antifraude -- reagem ao evento, nunca a chamada HTTP. E' o que
-      // separa ledger de liquidacao: o livro fecha aqui, a conciliacao
-      // acontece depois, e uma falha la nao desfaz o Pix.
+      // Fase D: os eventos ja estao no outbox, gravados no mesmo COMMIT. O
+      // relay publica no Kafka e os consumidores -- push, webhook, SPI
+      // Adapter -- reagem ao evento, nunca a chamada HTTP.
       this.logger.log(
-        `Pix ${transacao.id} concluido: ${paraTexto(valor)} de ${origem.nome} para ${favorecido}`,
+        destino.externo
+          ? `Pix ${transacao.id} aceito (${concluida.endToEndId}): ${paraTexto(valor)} de ${origem.nome} para ${favorecido}; aguardando SPI`
+          : `Pix ${transacao.id} concluido: ${paraTexto(valor)} de ${origem.nome} para ${favorecido}`,
       );
 
       return concluida;
@@ -410,6 +454,73 @@ export class PixService {
 
       throw erro;
     }
+  }
+
+  /** Comando para o SPI Adapter montar, assinar e enviar o pacs.008. */
+  private async enfileirarPacs008(
+    tx: Tx,
+    transacao: Transacao,
+    origem: ContaPublica,
+  ): Promise<void> {
+    const ordem = montarOrdemPagamento(
+      transacao,
+      origem,
+      this.ispb,
+      this.ispbContraparte,
+    );
+    await this.outbox.registrar<DadosMensagemSpi>(tx, {
+      topico: TOPICOS.SPI_SAIDA,
+      chave: ordem.endToEndId,
+      eventType: EVENTO_SPI.COMANDO_ENVIAR,
+      aggregateType: 'PixPagamento',
+      aggregateId: ordem.endToEndId,
+      correlationId: transacao.id,
+      data: { tipo: 'pacs.008', mensagem: ordem },
+    });
+  }
+
+  /**
+   * Pix interno liquida na hora: um evento para cada lado (push "Pix enviado"
+   * para quem pagou, "Pix recebido" para quem recebeu).
+   */
+  private async eventosPixInterno(
+    tx: Tx,
+    t: Transacao,
+    origem: ContaPublica,
+    destino: DestinoPix,
+  ): Promise<void> {
+    const base = {
+      transacaoId: t.id,
+      endToEndId: null,
+      ...valorDoEvento(t.valor),
+    };
+    const causa = { correlationId: t.id };
+    await registrarEventoPix(
+      this.outbox,
+      tx,
+      EVENTOS_PIX.LIQUIDADO,
+      {
+        ...base,
+        contaId: origem.id,
+        status: 'LIQUIDADO',
+        direcao: 'ENVIADO',
+        contraparte: { nome: destino.conta.nome, banco: null },
+      },
+      causa,
+    );
+    await registrarEventoPix(
+      this.outbox,
+      tx,
+      EVENTOS_PIX.RECEBIDO,
+      {
+        ...base,
+        contaId: destino.conta.id,
+        status: 'RECEBIDO',
+        direcao: 'RECEBIDO',
+        contraparte: { nome: origem.nome, banco: null },
+      },
+      causa,
+    );
   }
 
   /** A intencao falhou, mas a intencao EXISTE. E por isso que ela e' registrada. */

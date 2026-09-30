@@ -1,6 +1,16 @@
-import { Body, Controller, HttpStatus, Post, Res } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpStatus,
+  Param,
+  ParseUUIDPipe,
+  Post,
+  Res,
+} from '@nestjs/common';
 import type { Response } from 'express';
 import {
+  ApiAcceptedResponse,
   ApiBearerAuth,
   ApiConflictResponse,
   ApiCreatedResponse,
@@ -11,6 +21,11 @@ import {
 } from '@nestjs/swagger';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { paraTexto } from '../common/utils/dinheiro';
+import { DevolucoesService } from './devolucoes.service';
+import {
+  DevolucaoResponseDto,
+  SolicitarDevolucaoDto,
+} from './dto/devolucao.dto';
 import { PixService } from './pix.service';
 import { TransferirDto } from './dto/transferir.dto';
 import { TransferirResponseDto } from './dto/transferir-response.dto';
@@ -20,7 +35,10 @@ import type { ReenvioIdempotente, ResultadoTransferencia } from './pix.types';
 @ApiBearerAuth()
 @Controller('pix')
 export class PixController {
-  constructor(private readonly pixService: PixService) {}
+  constructor(
+    private readonly pixService: PixService,
+    private readonly devolucoes: DevolucoesService,
+  ) {}
 
   @Post('transferir')
   @ApiOperation({
@@ -35,7 +53,17 @@ export class PixController {
       '**Idempotencia:** reenviar com a MESMA `idempotencyKey` nao debita de',
       'novo -- devolve 200 com a transacao original. E o que protege contra o',
       'botao clicado duas vezes e contra o app reenviando a requisicao.',
+      '',
+      "**Pix para outro banco (assincrono):** o valor e' debitado na hora e a",
+      "resposta e' **202** com `status: PENDENTE` e o `endToEndId`. O pacs.008",
+      'segue pelo Kafka ao SPI; o resultado (pacs.002) chega por push,',
+      'webhook (`pix.payment.settled` / `pix.payment.rejected`) e em',
+      'GET /api/transacoes/:id. Rejeitado = estorno automatico.',
     ].join('\n'),
+  })
+  @ApiAcceptedResponse({
+    type: TransferirResponseDto,
+    description: 'Pix para outro banco aceito; aguardando o SPI',
   })
   @ApiCreatedResponse({
     type: TransferirResponseDto,
@@ -61,13 +89,55 @@ export class PixController {
     if (this.eReenvio(saida)) {
       // Reenvio: mesma representacao, 200 em vez de 201. O corpo e' identico
       // ao da primeira chamada, entao o front nao precisa de nenhum branch --
-      // ele so ve que deu certo.
-      resposta.status(HttpStatus.OK);
+      // ele so ve que deu certo. Pix externo ainda no SPI continua 202.
+      resposta.status(
+        saida.emProcessamento ? HttpStatus.ACCEPTED : HttpStatus.OK,
+      );
       return this.responder(saida.resultado);
     }
 
-    resposta.status(HttpStatus.CREATED);
+    resposta.status(
+      saida.transacao.statusSpi ? HttpStatus.ACCEPTED : HttpStatus.CREATED,
+    );
     return this.responder(saida);
+  }
+
+  @Post('transacoes/:id/devolucoes')
+  @ApiOperation({
+    summary: 'Devolve (pacs.004) um Pix recebido de outro banco',
+    description: [
+      'So para Pix RECEBIDO de outra instituicao. Pode ser parcial; a soma das',
+      'devolucoes nunca passa do valor original. O valor sai da conta na hora',
+      '(202, status SOLICITADA); o pacs.004 vai ao SPI pelo Kafka e o pacs.002',
+      'conclui (LIQUIDADA) ou estorna (REJEITADA). Idempotente por',
+      '`idempotencyKey`.',
+    ].join('\n'),
+  })
+  @ApiAcceptedResponse({ type: DevolucaoResponseDto })
+  async devolver(
+    @CurrentUser('contaId') contaId: string,
+    @Param('id', ParseUUIDPipe) transacaoId: string,
+    @Body() dto: SolicitarDevolucaoDto,
+    @Res({ passthrough: true }) resposta: Response,
+  ): Promise<DevolucaoResponseDto> {
+    const { devolucao, nova } = await this.devolucoes.solicitar(
+      contaId,
+      transacaoId,
+      dto,
+    );
+    resposta.status(nova ? HttpStatus.ACCEPTED : HttpStatus.OK);
+    return DevolucoesService.serializar(devolucao);
+  }
+
+  @Get('transacoes/:id/devolucoes')
+  @ApiOperation({ summary: 'Devolucoes (enviadas e recebidas) de um Pix' })
+  @ApiOkResponse({ type: [DevolucaoResponseDto] })
+  async listarDevolucoes(
+    @CurrentUser('contaId') contaId: string,
+    @Param('id', ParseUUIDPipe) transacaoId: string,
+  ): Promise<DevolucaoResponseDto[]> {
+    const lista = await this.devolucoes.listar(contaId, transacaoId);
+    return lista.map((d) => DevolucoesService.serializar(d));
   }
 
   private eReenvio(
@@ -88,6 +158,8 @@ export class PixController {
       idempotencyKey: resultado.transacao.idempotencyKey,
       tipo: resultado.transacao.tipo,
       status: resultado.transacao.status,
+      endToEndId: resultado.transacao.endToEndId,
+      statusSpi: resultado.transacao.statusSpi,
       valor: paraTexto(resultado.transacao.valor),
       tipoChave: resultado.transacao.tipoChave,
       chaveDestino: resultado.transacao.chaveDestino,

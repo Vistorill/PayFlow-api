@@ -26,7 +26,17 @@ export class LancamentoResponseDto {
   @ApiProperty({ example: '2026-01-01T12:00:00.000Z' })
   createdAt: string;
 
-  @ApiProperty({ enum: ['PIX', 'BOLETO', 'CARTAO', 'SAQUE', 'CREDITO'] })
+  @ApiProperty({
+    enum: [
+      'PIX',
+      'BOLETO',
+      'CARTAO',
+      'SAQUE',
+      'CREDITO',
+      'ESTORNO',
+      'DEVOLUCAO',
+    ],
+  })
   tipoTransacao: string;
 
   @ApiProperty({ enum: ['CPF', 'EMAIL', 'TELEFONE'], nullable: true })
@@ -38,6 +48,18 @@ export class LancamentoResponseDto {
     description: 'Chave Pix usada na transacao (null se nao for Pix)',
   })
   chaveDestino: string | null;
+
+  @ApiProperty({
+    enum: ['PENDENTE', 'CONCLUIDA', 'FALHA'],
+    description: 'Status da transacao dona do lancamento',
+  })
+  statusTransacao: string;
+
+  @ApiProperty({
+    nullable: true,
+    description: 'Estado no SPI (so Pix entre instituicoes)',
+  })
+  statusSpi: string | null;
 }
 
 export class SaldoResponseDto {

@@ -46,7 +46,17 @@ export class TransacaoDetalheDto {
   @ApiProperty({ format: 'uuid' })
   id: string;
 
-  @ApiProperty({ enum: ['PIX', 'BOLETO', 'CARTAO', 'SAQUE', 'CREDITO'] })
+  @ApiProperty({
+    enum: [
+      'PIX',
+      'BOLETO',
+      'CARTAO',
+      'SAQUE',
+      'CREDITO',
+      'ESTORNO',
+      'DEVOLUCAO',
+    ],
+  })
   tipo: string;
 
   @ApiProperty({ enum: ['PENDENTE', 'CONCLUIDA', 'FALHA'] })
@@ -60,6 +70,36 @@ export class TransacaoDetalheDto {
 
   @ApiProperty({ example: '50.00' })
   valor: string;
+
+  @ApiProperty({
+    nullable: true,
+    example: 'E12345678202609291200A1B2C3D4E5F',
+    description: 'EndToEndId ISO 20022 (so Pix entre instituicoes)',
+  })
+  endToEndId: string | null;
+
+  @ApiProperty({
+    nullable: true,
+    enum: [
+      'CRIADO',
+      'ENVIADO',
+      'LIQUIDADO',
+      'REJEITADO',
+      'RECONCILIANDO',
+      'RECEBIDO',
+      'DEVOLVIDO_PARCIAL',
+      'DEVOLVIDO',
+    ],
+    description: 'Estado no SPI. Null em Pix interno.',
+  })
+  statusSpi: string | null;
+
+  @ApiProperty({
+    nullable: true,
+    example: 'AC03',
+    description: 'Motivo do pacs.002 RJCT',
+  })
+  motivoRejeicao: string | null;
 
   @ApiProperty({ type: ParteDaTransacaoDto })
   origem: ParteDaTransacaoDto;
