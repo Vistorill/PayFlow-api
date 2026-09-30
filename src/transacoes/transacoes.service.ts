@@ -66,7 +66,20 @@ export class TransacoesService {
       status: t.status,
       direcao: enviou ? 'ENVIADA' : 'RECEBIDA',
       valor: paraTexto(t.valor),
-      origem: exibirParte(t.origem),
+      endToEndId: t.endToEndId,
+      statusSpi: t.statusSpi,
+      motivoRejeicao: t.motivoRejeicao,
+      // Pix recebido de outro banco (pacs.008): a origem no ledger e' a conta
+      // de liquidacao; no comprovante aparece quem pagou.
+      origem: t.pagadorNome
+        ? {
+            nome: t.pagadorNome,
+            cpf: null,
+            eVoce: false,
+            externo: true,
+            banco: t.pagadorBanco,
+          }
+        : exibirParte(t.origem),
       // Pix para outro banco: o destino no ledger e' a conta de liquidacao;
       // no comprovante aparece o favorecido real.
       destino: t.favorecidoNome

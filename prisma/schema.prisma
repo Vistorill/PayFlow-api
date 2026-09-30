@@ -31,12 +31,15 @@ model Conta {
   createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
 
-  usuario     Usuario?
-  comoOrigem  Transacao[]  @relation("TransacaoOrigem")
-  comoDestino Transacao[]  @relation("TransacaoDestino")
-  lancamentos Lancamento[]
-  contatos    ContatoPix[] @relation("ContatoDono")
-  contatoDe   ContatoPix[] @relation("ContatoDestino")
+  usuario      Usuario?
+  comoOrigem   Transacao[]       @relation("TransacaoOrigem")
+  comoDestino  Transacao[]       @relation("TransacaoDestino")
+  lancamentos  Lancamento[]
+  contatos     ContatoPix[]      @relation("ContatoDono")
+  contatoDe    ContatoPix[]      @relation("ContatoDestino")
+  webhooks     WebhookEndpoint[]
+  dispositivos DispositivoPush[]
+  notificacoes Notificacao[]
 
   @@index([nome])
   @@map("contas")
@@ -78,15 +81,33 @@ model Transacao {
   // (destinoId) e o favorecido real fica registrado aqui. Null em Pix interno.
   favorecidoNome  String?         @map("favorecido_nome") @db.VarChar(120)
   favorecidoBanco String?         @map("favorecido_banco") @db.VarChar(60)
-  createdAt       DateTime        @default(now()) @map("created_at") @db.DateTime(3)
-  updatedAt       DateTime        @updatedAt @map("updated_at") @db.DateTime(3)
+  // Pix RECEBIDO de outra instituicao (pacs.008 de entrada): quem pagou. A
+  // origem no ledger e' a conta de liquidacao.
+  pagadorNome     String?         @map("pagador_nome") @db.VarChar(120)
+  pagadorBanco    String?         @map("pagador_banco") @db.VarChar(60)
 
-  origem      Conta        @relation("TransacaoOrigem", fields: [origemId], references: [id], onDelete: Restrict)
-  destino     Conta        @relation("TransacaoDestino", fields: [destinoId], references: [id], onDelete: Restrict)
-  lancamentos Lancamento[]
+  // --- Campos SPI: so Pix que cruza instituicoes; null em Pix interno ---
+  // EndToEndId ISO 20022: E + ISPB(8) + yyyyMMddHHmm + 11 alfanumericos.
+  endToEndId     String?     @unique @map("end_to_end_id") @db.VarChar(32)
+  direcaoSpi     DirecaoSpi? @map("direcao_spi")
+  statusSpi      StatusSpi?  @map("status_spi")
+  // Codigo de motivo do pacs.002 RJCT (ex.: AC03).
+  motivoRejeicao String?     @map("motivo_rejeicao") @db.VarChar(8)
+  // Lock otimista das transicoes da maquina de estados SPI.
+  versao         Int         @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  origem          Conta          @relation("TransacaoOrigem", fields: [origemId], references: [id], onDelete: Restrict)
+  destino         Conta          @relation("TransacaoDestino", fields: [destinoId], references: [id], onDelete: Restrict)
+  lancamentos     Lancamento[]
+  devolucoes      PixDevolucao[] @relation("DevolucaoOriginal")
+  devolucaoLedger PixDevolucao?  @relation("DevolucaoLedger")
 
   @@index([origemId, createdAt])
   @@index([destinoId])
+  @@index([statusSpi, updatedAt])
   @@map("transacoes")
 }
 
@@ -148,6 +169,10 @@ enum TipoTransacao {
   CARTAO
   SAQUE
   CREDITO
+  // Dinheiro de volta ao cliente quando o SPI rejeita (pacs.002 RJCT).
+  ESTORNO
+  // Movimento de uma devolucao Pix (pacs.004), enviada ou recebida.
+  DEVOLUCAO
 }
 
 enum TipoChavePix {
@@ -165,4 +190,233 @@ enum StatusTransacao {
 enum TipoLancamento {
   DEBITO
   CREDITO
+}
+
+// ===========================================================================
+// Mensageria assincrona: SPI (pacs.008/002/004), Kafka, webhooks e push.
+// Ver docs/mensageria-implementacao.md.
+// ===========================================================================
+
+/**
+ * Sentido do Pix em relacao ao SPI.
+ */
+enum DirecaoSpi {
+  ENVIADO // nosso cliente pagou alguem de outro banco
+  RECEBIDO // alguem de outro banco pagou nosso cliente
+}
+
+/**
+ * Maquina de estados SPI de um Pix (ver src/pix/spi/estados.ts).
+ */
+enum StatusSpi {
+  CRIADO // aceito pela API, pacs.008 ainda nao saiu
+  ENVIADO // pacs.008 entregue ao SPI, aguardando pacs.002
+  LIQUIDADO // pacs.002 ACCC/ACSC
+  REJEITADO // pacs.002 RJCT (houve estorno)
+  RECONCILIANDO // sem pacs.002 no prazo: o job consulta o SPI
+  RECEBIDO // pacs.008 de entrada creditado
+  DEVOLVIDO_PARCIAL // pacs.004 cobriu parte do valor
+  DEVOLVIDO // pacs.004 cobriu o valor inteiro
+}
+
+enum DirecaoDevolucao {
+  ENVIADA // nos devolvemos (pacs.004 de saida)
+  RECEBIDA // devolveram um Pix nosso (pacs.004 de entrada)
+}
+
+enum StatusDevolucao {
+  SOLICITADA
+  ENVIADA
+  LIQUIDADA
+  REJEITADA
+}
+
+/**
+ * Devolucao Pix (pacs.004).
+ */
+model PixDevolucao {
+  id                  String           @id @default(uuid()) @db.Char(36)
+  // RtrId ISO 20022: D + ISPB(8) + yyyyMMddHHmm + 11 alfanumericos.
+  returnId            String           @unique @map("return_id") @db.VarChar(32)
+  // So a devolucao pedida pelo nosso cliente tem chave de idempotencia.
+  idempotencyKey      String?          @unique @map("idempotency_key") @db.VarChar(100)
+  transacaoOriginalId String           @map("transacao_original_id") @db.Char(36)
+  // Transacao do ledger que moveu o dinheiro desta devolucao.
+  transacaoLedgerId   String?          @unique @map("transacao_ledger_id") @db.Char(36)
+  direcao             DirecaoDevolucao
+  status              StatusDevolucao
+  valor               Decimal          @db.Decimal(15, 2)
+  motivo              String           @db.VarChar(8)
+  infoAdicional       String?          @map("info_adicional") @db.VarChar(140)
+  motivoRejeicao      String?          @map("motivo_rejeicao") @db.VarChar(8)
+  versao              Int              @default(0)
+  createdAt           DateTime         @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt           DateTime         @updatedAt @map("updated_at") @db.DateTime(3)
+
+  transacaoOriginal Transacao  @relation("DevolucaoOriginal", fields: [transacaoOriginalId], references: [id], onDelete: Restrict)
+  transacaoLedger   Transacao? @relation("DevolucaoLedger", fields: [transacaoLedgerId], references: [id], onDelete: Restrict)
+
+  @@index([transacaoOriginalId])
+  @@index([status, updatedAt])
+  @@map("pix_devolucoes")
+}
+
+/**
+ * Toda mensagem ISO 20022 que entrou ou saiu, com o XML bruto: e' a prova em
+ * disputa e auditoria. Em producao o XML vai para storage de objetos
+ * criptografado e aqui fica so a referencia.
+ */
+model PixSpiMensagem {
+  id               String   @id @default(uuid()) @db.Char(36)
+  messageId        String   @map("message_id") @db.VarChar(32)
+  tipo             String   @db.VarChar(16) // pacs.008 | pacs.002 | pacs.004
+  direcao          String   @db.VarChar(8) // ENTRADA | SAIDA
+  endToEndId       String?  @map("end_to_end_id") @db.VarChar(32)
+  returnId         String?  @map("return_id") @db.VarChar(32)
+  xml              String   @db.MediumText
+  assinaturaValida Boolean  @map("assinatura_valida")
+  createdAt        DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@unique([messageId, direcao])
+  @@index([endToEndId])
+  @@index([returnId])
+  @@map("pix_spi_mensagens")
+}
+
+/**
+ * Transactional Outbox: o evento e' gravado na MESMA transacao do banco que o
+ * gerou, e o OutboxRelay publica no Kafka depois. Nunca "gravou e nao publicou".
+ */
+model OutboxEvento {
+  id          String    @id @db.Char(36) // = eventId do envelope
+  aggregateId String    @map("aggregate_id") @db.VarChar(64)
+  topico      String    @db.VarChar(128)
+  chave       String    @db.VarChar(64) // chave de particao Kafka
+  tipoEvento  String    @map("tipo_evento") @db.VarChar(64)
+  payload     Json
+  status      String    @default("PENDENTE") @db.VarChar(12) // PENDENTE | PUBLICADO
+  tentativas  Int       @default(0)
+  ultimoErro  String?   @map("ultimo_erro") @db.VarChar(500)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  publicadoEm DateTime? @map("publicado_em") @db.DateTime(3)
+
+  @@index([status, createdAt])
+  @@map("outbox_eventos")
+}
+
+/**
+ * Inbox: consumo idempotente. Cada (consumidor, messageId) processa uma vez.
+ */
+model InboxEvento {
+  consumidor   String   @db.VarChar(64)
+  messageId    String   @map("message_id") @db.VarChar(64)
+  processadoEm DateTime @default(now()) @map("processado_em") @db.DateTime(3)
+
+  @@id([consumidor, messageId])
+  @@map("inbox_eventos")
+}
+
+enum StatusWebhookEndpoint {
+  ATIVO
+  SUSPENSO // circuit breaker: falhas demais seguidas
+  DESATIVADO // pelo dono
+}
+
+enum StatusWebhookEntrega {
+  PENDENTE
+  ENTREGUE
+  RETENTANDO
+  ESGOTADO // acabaram as tentativas -> DLQ
+  FALHA_PERMANENTE // 4xx nao retentavel -> DLQ
+}
+
+model WebhookEndpoint {
+  id                     String                @id @default(uuid()) @db.Char(36)
+  contaId                String                @map("conta_id") @db.Char(36)
+  url                    String                @db.VarChar(500)
+  descricao              String?               @db.VarChar(140)
+  // Segredos HMAC cifrados com AES-256-GCM (WEBHOOK_CHAVE_CIFRA).
+  segredoCifrado         String                @map("segredo_cifrado") @db.VarChar(255)
+  // Segredo antigo, ainda assinado por uma janela depois do rotate-secret.
+  segredoAnteriorCifrado String?               @map("segredo_anterior_cifrado") @db.VarChar(255)
+  segredoAnteriorAte     DateTime?             @map("segredo_anterior_ate") @db.DateTime(3)
+  eventos                Json
+  status                 StatusWebhookEndpoint @default(ATIVO)
+  falhasConsecutivas     Int                   @default(0) @map("falhas_consecutivas")
+  createdAt              DateTime              @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt              DateTime              @updatedAt @map("updated_at") @db.DateTime(3)
+
+  conta    Conta            @relation(fields: [contaId], references: [id], onDelete: Cascade)
+  entregas WebhookEntrega[]
+
+  @@index([contaId])
+  @@map("webhook_endpoints")
+}
+
+model WebhookEntrega {
+  id                 String               @id @default(uuid()) @db.Char(36)
+  endpointId         String               @map("endpoint_id") @db.Char(36)
+  eventoId           String               @map("evento_id") @db.VarChar(64)
+  tipoEvento         String               @map("tipo_evento") @db.VarChar(64)
+  payload            Json
+  status             StatusWebhookEntrega @default(PENDENTE)
+  tentativa          Int                  @default(0)
+  ultimoHttpStatus   Int?                 @map("ultimo_http_status")
+  ultimoErro         String?              @map("ultimo_erro") @db.VarChar(500)
+  // Null = nao agendada (em voo, terminada ou endpoint suspenso).
+  proximaTentativaEm DateTime?            @map("proxima_tentativa_em") @db.DateTime(3)
+  entregueEm         DateTime?            @map("entregue_em") @db.DateTime(3)
+  createdAt          DateTime             @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt          DateTime             @updatedAt @map("updated_at") @db.DateTime(3)
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@unique([endpointId, eventoId])
+  @@index([status, proximaTentativaEm])
+  @@map("webhook_entregas")
+}
+
+enum PlataformaDispositivo {
+  ANDROID
+  IOS
+  WEB
+}
+
+/**
+ * Token de push do app mobile (Expo/FCM/APNs).
+ */
+model DispositivoPush {
+  id         String                @id @default(uuid()) @db.Char(36)
+  contaId    String                @map("conta_id") @db.Char(36)
+  token      String                @unique @db.VarChar(255)
+  plataforma PlataformaDispositivo
+  ativo      Boolean               @default(true)
+  createdAt  DateTime              @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt  DateTime              @updatedAt @map("updated_at") @db.DateTime(3)
+
+  conta Conta @relation(fields: [contaId], references: [id], onDelete: Cascade)
+
+  @@index([contaId, ativo])
+  @@map("dispositivos_push")
+}
+
+/**
+ * Caixa de notificacoes do app. Um evento gera no maximo 1 por conta.
+ */
+model Notificacao {
+  id        String    @id @default(uuid()) @db.Char(36)
+  contaId   String    @map("conta_id") @db.Char(36)
+  eventoId  String    @map("evento_id") @db.VarChar(64)
+  tipo      String    @db.VarChar(64)
+  titulo    String    @db.VarChar(120)
+  corpo     String    @db.VarChar(255)
+  dados     Json
+  lidaEm    DateTime? @map("lida_em") @db.DateTime(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  conta Conta @relation(fields: [contaId], references: [id], onDelete: Cascade)
+
+  @@unique([contaId, eventoId])
+  @@index([contaId, createdAt])
+  @@map("notificacoes")
 }

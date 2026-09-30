@@ -21,6 +21,10 @@ async function bootstrap() {
 
   app.enableCors({ origin: true, credentials: true });
 
+  // SIGTERM/SIGINT disparam onModuleDestroy: consumers Kafka saem do grupo
+  // (rebalance limpo) e os timers do outbox/reconciliacao/webhooks param.
+  app.enableShutdownHooks();
+
   const swaggerConfig = new DocumentBuilder()
     .setTitle('Cactvs Payments API')
     .setDescription(

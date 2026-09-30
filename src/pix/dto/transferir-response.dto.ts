@@ -35,6 +35,29 @@ export class TransferirResponseDto {
   })
   status: string;
 
+  @ApiProperty({
+    example: 'E12345678202609291200A1B2C3D4E5F',
+    nullable: true,
+    description: 'EndToEndId ISO 20022. So em Pix para outro banco.',
+  })
+  endToEndId: string | null;
+
+  @ApiProperty({
+    enum: [
+      'CRIADO',
+      'ENVIADO',
+      'LIQUIDADO',
+      'REJEITADO',
+      'RECONCILIANDO',
+      'RECEBIDO',
+      'DEVOLVIDO_PARCIAL',
+      'DEVOLVIDO',
+    ],
+    nullable: true,
+    description: 'Estado no SPI. Null em Pix interno (liquida na hora).',
+  })
+  statusSpi: string | null;
+
   @ApiProperty({ example: '50.00' })
   valor: string;
 
