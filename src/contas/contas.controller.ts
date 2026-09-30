@@ -79,6 +79,8 @@ export class ContasController {
           tipoTransacao: lancamento.transacao.tipo,
           tipoChave: lancamento.transacao.tipoChave,
           chaveDestino: lancamento.transacao.chaveDestino,
+          statusTransacao: lancamento.transacao.status,
+          statusSpi: lancamento.transacao.statusSpi,
         }),
       ),
       take: resultado.take,

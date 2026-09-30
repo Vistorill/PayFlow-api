@@ -18,6 +18,8 @@ export interface LancamentoExtrato {
     tipo: string;
     tipoChave: string | null;
     chaveDestino: string | null;
+    status: string;
+    statusSpi: string | null;
   };
 }
 

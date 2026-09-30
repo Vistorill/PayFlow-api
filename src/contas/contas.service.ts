@@ -127,7 +127,13 @@ export class ContasService {
         // o detalhe completo fica em GET /transacoes/:id.
         include: {
           transacao: {
-            select: { tipo: true, tipoChave: true, chaveDestino: true },
+            select: {
+              tipo: true,
+              tipoChave: true,
+              chaveDestino: true,
+              status: true,
+              statusSpi: true,
+            },
           },
         },
       }),
